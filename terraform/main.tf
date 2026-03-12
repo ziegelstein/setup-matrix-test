@@ -39,6 +39,67 @@ provider "aws" {
   }
 }
 
+locals {
+  # Windows paths usually begin with a drive letter (e.g. C:\)
+  is_windows = can(regex("^[A-Za-z]:", pathexpand("~")))
+
+  wait_for_nodes_windows_script = <<-EOT
+    $ErrorActionPreference = "Continue"
+
+    Write-Host "Configuring kubectl..."
+    aws eks update-kubeconfig --region ${var.aws_region} --name ${var.cluster_name}
+
+    Write-Host "Waiting for EKS nodes to join and become Ready..."
+    for ($i = 1; $i -le 60; $i++) {
+      Write-Host "--- Attempt $i ---"
+      Write-Host "All nodes:"
+      $allNodes = kubectl get nodes 2>&1
+      if ($allNodes) {
+        $allNodes | ForEach-Object { Write-Host $_ }
+      }
+
+      $readyNodes = 0
+      $nodeLines = kubectl get nodes --no-headers 2>$null
+      if ($LASTEXITCODE -eq 0 -and $nodeLines) {
+        $readyNodes = @($nodeLines | Where-Object { $_ -match "\bReady\b" }).Count
+      }
+
+      Write-Host "$readyNodes nodes ready (need ${var.desired_capacity})"
+
+      if ($readyNodes -ge ${var.desired_capacity}) {
+        Write-Host "All nodes are ready!"
+        exit 0
+      }
+
+      Start-Sleep -Seconds 15
+    }
+
+    throw "Timeout waiting for nodes"
+  EOT
+
+  wait_for_nodes_linux_script = <<-EOT
+    echo "Configuring kubectl..."
+    aws eks update-kubeconfig --region ${var.aws_region} --name ${var.cluster_name}
+
+    echo "Waiting for EKS nodes to join and become Ready..."
+    for i in $(seq 1 60); do
+      echo "--- Attempt $i ---"
+      echo "All nodes:"
+      kubectl get nodes 2>&1 || true
+
+      READY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready" || echo 0)
+      echo "$READY_NODES nodes ready (need ${var.desired_capacity})"
+
+      if [ "$READY_NODES" -ge ${var.desired_capacity} ]; then
+        echo "All nodes are ready!"
+        exit 0
+      fi
+      sleep 15
+    done
+    echo "Timeout waiting for nodes" && exit 1
+  EOT
+}
+
 # SSM Module - Manages secrets in AWS Parameter Store
 module "ssm" {
   source = "./modules/ssm"
@@ -129,28 +190,8 @@ resource "null_resource" "wait_for_nodes" {
   depends_on = [kubernetes_config_map.aws_auth]
 
   provisioner "local-exec" {
-    command = <<-EOT
-      echo "Configuring kubectl..."
-      aws eks update-kubeconfig --region ${var.aws_region} --name ${var.cluster_name}
-      
-      echo "Waiting for EKS nodes to join and become Ready..."
-      for i in $(seq 1 60); do
-        echo "--- Attempt $i ---"
-        echo "All nodes:"
-        kubectl get nodes 2>&1 || true
-        
-        READY_NODES=$(kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready" || echo 0)
-        echo "$READY_NODES nodes ready (need ${var.desired_capacity})"
-        
-        if [ "$READY_NODES" -ge ${var.desired_capacity} ]; then
-          echo "All nodes are ready!"
-          exit 0
-        fi
-        sleep 15
-      done
-      echo "Timeout waiting for nodes" && exit 1
-    EOT
-    interpreter = ["/bin/bash", "-c"]
+    command     = local.is_windows ? local.wait_for_nodes_windows_script : local.wait_for_nodes_linux_script
+    interpreter = local.is_windows ? ["PowerShell", "-Command"] : ["/bin/bash", "-c"]
   }
 }
 
